@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using System.Linq;
 using System.Text;
+using System.Text.RegularExpressions;
 
 
 
@@ -19,16 +20,34 @@ public class Switch
     public bool B_Socket;
     public GameObject Socket;
     public GameObject SwitchModel;
-    public void RandomState()
+    public void RandomState(bool fallBackToDefault = false, int defaultStates = -1)
     {
-        int state = Random.Range(0, 2);
-        switch (state)
+        int ro;
+        if (fallBackToDefault && defaultStates < 2 && defaultStates >= 0)
+            ro = defaultStates;
+        else
+            ro = Random.Range(0, 2);
+        switch (ro)
         {
             case 0:
                 this.State = false;
                 this.SwitchModel.gameObject.transform.localEulerAngles = new Vector3(-55f, 0, 0);
                 break;
             case 1:
+                this.State = true;
+                this.SwitchModel.gameObject.transform.localEulerAngles = new Vector3(55f, 0, 0);
+                break;
+        }
+    }
+    public void ChosenInitialState(bool state)
+    {
+        switch (state)
+        {
+            case false:
+                this.State = false;
+                this.SwitchModel.gameObject.transform.localEulerAngles = new Vector3(-55f, 0, 0);
+                break;
+            case true:
                 this.State = true;
                 this.SwitchModel.gameObject.transform.localEulerAngles = new Vector3(55f, 0, 0);
                 break;
@@ -49,6 +68,21 @@ public struct LED
     public Material Color1;
     public Material Color2;
 }
+public struct SwitchGraphs
+{
+    public bool[] SwitchState { get { return _switchState; } }
+    public bool[] PreviousState { get { return _previousState; } }
+    public int FlipIndex {  get { return _flipIndex; } }
+    public SwitchGraphs(bool[] switchState, bool[] previousState = null, int flipIndex = -1)
+    {
+        _switchState = switchState;
+        _previousState = previousState;
+        _flipIndex = flipIndex;
+    }
+    private bool[] _switchState;
+    private bool[] _previousState;
+    private int _flipIndex;
+}
 public class MultiColoredSwitches : MonoBehaviour
 {
     public Material[] SwitchesAndSocketsColors;
@@ -68,13 +102,18 @@ public class MultiColoredSwitches : MonoBehaviour
     private Material[] LEDRow2Cycle1 = new Material[5];
     private Material[] LEDRow2Cycle2 = new Material[5];
     public KMBombModule module;
+	private Coroutine ActiveCoroutine = null;
+    private List<SwitchGraphs> StateExists = new List<SwitchGraphs>(); //For Breadth First Search Algorithm
     private string LoggingSwitchesStates;
     private bool[] SwitchesStates = new bool[5];
     private bool[] SubmissionState = new bool[5];
     private bool[] RemovedState = new bool[5];
     private bool[] ExpectedSwitchesStates = new bool[5];
+    private bool Animation = false;
+    private List<int> SolveSequence = new List<int>();
+    private int tries = 0; //For Breadth First Search Algorithm
     string logstuff;
-    static int ModuleIDCounter;
+    static int ModuleIDCounter = 1;
     int[] SwitchesNumbers = new int[3];
     int[] SocketNumbers = new int[3];
     int MinSwitch;
@@ -91,6 +130,7 @@ public class MultiColoredSwitches : MonoBehaviour
     bool Solved;
     bool cycle1;
     int moduleID;
+    string parity;
     // Use this for initialization
     void Start()
     {
@@ -98,34 +138,70 @@ public class MultiColoredSwitches : MonoBehaviour
         string[] order = { " first flash of the first row ", " second flash of the first row ", " first flash of the second row ", " second flash of the second row " };
         string[] color = { " red ", " green ", " blue " };
         string[] thing = { "switches", "sockets" };
-        NewLEDS();
-        PickColorSwitchesAndSockets();
+        do
+        {
+            Generate();
+        }
+        while (!CheckPath());
+
+        for (int i = 0; i < 5; i++)
+        {
+            int j = i;
+            Switches[j].SwitchModel.GetComponent<KMSelectable>().OnInteract += delegate() { CheckSwitchFlip(j); GetComponent<KMAudio>().PlayGameSoundAtTransform(KMSoundOverride.SoundEffect.ButtonPress, Switches[j].SwitchModel.transform); Switches[j].SwitchModel.GetComponent<KMSelectable>().AddInteractionPunch(.25f); return false; };
+            ExpectedSwitchesStates[j] = Switches[j].State;
+        }
+
+        Debug.LogFormat("[Multicolored Switches #{0}] The LED states from top to bottom and in red, green, blue order should be:", moduleID);
+        for (int i = 0; i < 12; i++)
+        {
+            logstuff = "The" + color[i % 3] + "set of the" + order[i / 3] + "of LEDs should be";
+            Debug.LogFormat("[Multicolored Switches #{2}] {0},{1}", logstuff, TurnBitsToString(AllStates[i]), moduleID);
+        }
+        Debug.LogFormat("[Multicolored Switches #{1}] The initial state of the switches is : {0}", TurnBitsToString(SwitchesStates), moduleID);
+        for (int i = 0; i < 3; i++)
+            Debug.LogFormat("[Multicolored Switches #{3}] The number of{0}coloring in the {1} is {2}", color[i % 3], thing[0], SwitchesNumbers[i], moduleID);
+        for (int i = 0; i < 3; i++)
+            Debug.LogFormat("[Multicolored Switches #{3}] The number of{0}coloring in the {1} is {2}", color[i % 3], thing[1], SocketNumbers[i], moduleID);
+        Debug.LogFormat("[Multicolored Switches #{3}] The chosen set with the least number of {0} for the {1} is the{2}set", MinSwitch, thing[0], color[IndexMin(SwitchesNumbers)], moduleID);
+        Debug.LogFormat("[Multicolored Switches #{3}] The chosen set with the most number of {0} for the {1} is the{2}set", MaxSwitch, thing[0], color[IndexMax(SwitchesNumbers)], moduleID);
+        Debug.LogFormat("[Multicolored Switches #{3}] The chosen set with the least number of {0} for the {1} is the{2}set", MinSocket, thing[1], color[IndexMin(SocketNumbers)], moduleID);
+        Debug.LogFormat("[Multicolored Switches #{3}] The chosen set with the most number of {0} for the {1} is the{2}set", MaxSocket, thing[1], color[IndexMax(SocketNumbers)], moduleID);
+        Debug.LogFormat("[Multicolored Switches #{1}] The chosen minimum set is set number: {0}", SwitchReasoningMin() + 1, moduleID);
+        Debug.LogFormat("[Multicolored Switches #{1}] The chosen maximum set is set number: {0}", SwitchReasoningMax() + 1, moduleID);
+        Debug.LogFormat("[Multicolored Switches #{2}] The sets does {0} parity, so the chosen set is set number {1}", parity, ChosenSet + 1, moduleID);
+        Debug.LogFormat("[Multicolored Switches #{2}] The submission state is state {0} which is {1}", SolutionIndex + 1, TurnBitsToString(SubmissionState), moduleID);
+        Debug.LogFormat("[Multicolored Switches #{2}] The removed state is state {0} which is {1}", RemovedIndex + 1, TurnBitsToString(RemovedState), moduleID);
+        Debug.LogFormat("[Multicolored Switches #{0}] The sequence of flips in order is : {1}", moduleID, SequenceOfSolve(SolveSequence));
+    }
+    void Generate(bool fallBackToDefault = false)
+    {
+		if (ActiveCoroutine != null)
+			StopCoroutine(ActiveCoroutine);
+        var defaultLEDSets = new int [2][][] {  new int[2][]{ new int[5]{ 2, 0, 3, 2, 7 }, 
+                                                              new int[5]{ 5, 4, 3, 4, 5 } }, 
+                                                new int[2][]{ new int[5]{ 6, 3, 1, 0, 2 }, 
+                                                              new int[5]{ 0, 0, 3, 7, 4 } } };
+        NewLEDS(fallBackToDefault, defaultLEDSets ); //RED AND BLUE
+        PickColorSwitchesAndSockets(fallBackToDefault, new int [] { 6, 6, 6, 6, 6 }, new int[] { 1, 1, 1, 1, 1 }, new int[] { 2, 2, 2, 3, 3 });
         FindLEDBoolsColors(LEDsUp);
         FindLEDBoolsColors(LEDsDown);
-        Debug.LogFormat("[Multicolored Switches #{0}] The LED states from top to bottom and in red, green, blue order should be:", moduleID);
         while (CheckIfArrayHasSameValueInSelf(AllStates))
         {
             NewLEDS();
             FindLEDBoolsColors(LEDsUp);
             FindLEDBoolsColors(LEDsDown);
         }
-        while (SwitchesSameAsAllStates(SwitchesStates))
+
+        for (int i = 0; i < 5; i++)
         {
-            for(int i = 0; i < 5; i++)
-            {
-                Switches[i].RandomState();
-                SwitchesStates[i] = Switches[i].State;
-            }
+            Switches[i].ChosenInitialState(SwitchesStates[i]);
         }
 
-        for (int i = 0; i < 12; i++)
-        {
-            logstuff = "The" + color[i % 3] +"set of the"+ order[i / 3] + "of LEDs should be";
-            Debug.LogFormat("[Multicolored Switches #{2}] {0},{1}", logstuff, TurnBitsToString(AllStates[i]), moduleID);
-        }
-        StartCoroutine(FlickerLEDS());
-        Debug.LogFormat("[Multicolored Switches #{1}] The initial state of the switches is : {0}", TurnBitsToString(SwitchesStates), moduleID);
-        for(int i = 0; i < 5; i++)
+
+
+        ActiveCoroutine = StartCoroutine(FlickerLEDS());
+
+        for (int i = 0; i < 5; i++)
         {
             SwitchesColorStates[0][i] = Switches[i].R;
             SwitchesColorStates[1][i] = Switches[i].G;
@@ -134,32 +210,22 @@ public class MultiColoredSwitches : MonoBehaviour
             SocketsColorStates[1][i] = Switches[i].G_Socket;
             SocketsColorStates[2][i] = Switches[i].B_Socket;
         }
-        for(int i = 0; i < 3; i++)
-        {
-            SwitchesNumbers[i] = CountNumberState(SwitchesColorStates[i]);
-            Debug.LogFormat("[Multicolored Switches #{3}] The number of{0}coloring in the {1} is {2}", color[i%3],thing[0],SwitchesNumbers[i],moduleID);
-        }
         for (int i = 0; i < 3; i++)
         {
+            SwitchesNumbers[i] = CountNumberState(SwitchesColorStates[i]);
             SocketNumbers[i] = CountNumberState(SocketsColorStates[i]);
-            Debug.LogFormat("[Multicolored Switches #{3}] The number of{0}coloring in the {1} is {2}", color[i % 3], thing[1], SocketNumbers[i],moduleID);
         }
+
         MinSwitch = SwitchesNumbers.Min();
         MaxSwitch = SwitchesNumbers.Max();
         MinSocket = SocketNumbers.Min();
         MaxSocket = SocketNumbers.Max();
-        Debug.LogFormat("[Multicolored Switches #{3}] The chosen set with the least number of {0} for the {1} is the{2}set", MinSwitch, thing[0], color[IndexMin(SwitchesNumbers)],moduleID);
-        Debug.LogFormat("[Multicolored Switches #{3}] The chosen set with the most number of {0} for the {1} is the{2}set", MaxSwitch, thing[0], color[IndexMax(SwitchesNumbers)],moduleID);
-        Debug.LogFormat("[Multicolored Switches #{3}] The chosen set with the least number of {0} for the {1} is the{2}set", MinSocket, thing[1], color[IndexMin(SocketNumbers)],moduleID);
-        Debug.LogFormat("[Multicolored Switches #{3}] The chosen set with the most number of {0} for the {1} is the{2}set", MaxSocket, thing[1], color[IndexMax(SocketNumbers)],moduleID);
+
         for (int i = 0; i < 12; i++)
         {
             AllStatesNumbers[i] = CountNumberState(AllStates[i]);
         }
-        Debug.LogFormat("[Multicolored Switches #{1}] The chosen minimum set is set number: {0}", SwitchReasoningMin()+1,moduleID);
-        Debug.LogFormat("[Multicolored Switches #{1}] The chosen maximum set is set number: {0}", SwitchReasoningMax()+1,moduleID);
-        string parity;
-        if((CountNumberState(AllStates[SwitchReasoningMin()]) % 2)== (CountNumberState(AllStates[SwitchReasoningMax()]) % 2))
+        if ((CountNumberState(AllStates[SwitchReasoningMin()]) % 2) == (CountNumberState(AllStates[SwitchReasoningMax()]) % 2))
         {
             parity = "share";
             ChosenSet = SwitchReasoningMin();
@@ -169,16 +235,140 @@ public class MultiColoredSwitches : MonoBehaviour
             parity = "not share";
             ChosenSet = SwitchReasoningMax();
         }
-        Debug.LogFormat("[Multicolored Switches #{2}] The sets does {0} parity, so the chosen set is set number {1}", parity,ChosenSet+1,moduleID);
         SocketReasoning();
-        Debug.LogFormat("[Multicolored Switches #{2}] The submission state is state {0} which is {1}", SolutionIndex + 1 , TurnBitsToString(SubmissionState), moduleID);
-        Debug.LogFormat("[Multicolored Switches #{2}] The removed state is state {0} which is {1}", RemovedIndex + 1, TurnBitsToString(RemovedState), moduleID);
-        for (int i = 0; i < 5; i++)
+    }
+    string SequenceOfSolve(List<int> sth)
+    {
+        string s = "";
+        for(int i = 0; i < sth.Count; i++)
         {
-            int j = i;
-            Switches[j].SwitchModel.GetComponent<KMSelectable>().OnInteract += delegate() { CheckSwitchFlip(j); GetComponent<KMAudio>().PlayGameSoundAtTransform(KMSoundOverride.SoundEffect.ButtonPress, Switches[j].SwitchModel.transform); Switches[j].SwitchModel.GetComponent<KMSelectable>().AddInteractionPunch(.25f); return false; };
-            ExpectedSwitchesStates[j] = Switches[j].State;
+            s = s + sth[i].ToString() + " ";
         }
+        return s;
+    }
+    //Iterative Breadth First Search
+    bool CheckPath(bool Logging = true, bool autosolving = false)
+    {
+        //Ensuring that the module does not start from the forbidden states.
+        if (AllStates.Where(state => !state.SequenceEqual(SubmissionState) && !state.SequenceEqual(RemovedState)).Any(state => state.SequenceEqual(SwitchesStates)))
+        {
+            if (Logging)
+                Debug.LogFormat("<MultiColored Switches {0}> Started on a forbidden state on try {1}. Regenerating....", moduleID, tries + 1);
+            tries++;
+            return false;
+        }
+        SolveSequence.Clear();
+        StateExists.Clear();
+        Queue<bool[]> switchQueue = new Queue<bool[]>();
+        StateExists.Add(new SwitchGraphs(SwitchesStates));
+        switchQueue.Enqueue(SwitchesStates);
+        bool runOnce = false;
+        while(switchQueue.Count != 0)
+        {
+            var currentState = switchQueue.Dequeue();
+            if (currentState.SequenceEqual(SubmissionState))
+            {
+                if (!runOnce)
+                {
+                    for (int i = 0; i < 5; i++)
+                    {
+                        var newState = currentState.ToArray();
+                        newState[i] = !newState[i];
+                        if (AllStates.Where(state => !state.SequenceEqual(SubmissionState) && !state.SequenceEqual(RemovedState)).Any(state => state.SequenceEqual(newState)))
+                            continue;
+                        StateExists.Add(new SwitchGraphs(newState, currentState, i + 1));
+                        StateExists.Add(new SwitchGraphs(currentState, newState, i + 1));
+                        goto found;
+                    }
+                    if (Logging)
+                        Debug.LogFormat("<MultiColored Switches {0}> Started on submission state on try {1}, but all possible next states are invalid.... Regenerating....", moduleID, tries + 1);
+                    tries++;
+                    StateExists.Clear();
+                    switchQueue.Clear();
+                    return false;
+                }
+                found:
+                Stack<string> solutionPath = new Stack<string>();
+                SwitchGraphs solutionNode;
+                do
+                {
+                    solutionPath.Push(TurnBitsToString(currentState));
+                    solutionNode = StateExists.Where(state => state.SwitchState.SequenceEqual(currentState)).Last();
+                    //All items in the list are unique except in the case where the starting and final position are the same. In which case, the last item will be the same as the first, so just remove last item.
+                    //This is to prevent infinite while loop if such case occurs.
+                    if (solutionNode.SwitchState.SequenceEqual(SubmissionState)) 
+                        StateExists.RemoveAt(StateExists.Count - 1);
+                    if (solutionNode.PreviousState == null) break;
+                    SolveSequence.Add(solutionNode.FlipIndex);
+                    currentState = solutionNode.PreviousState.ToArray();
+                }
+                while (true);
+                //If the shortest path has a length less than 3, then regenerate.
+                if (SolveSequence.Count < 3 && !autosolving)
+                {
+                    if (Logging)
+                        Debug.LogFormat("<Multicolored Switches {0}> A valid path is found in {1} tries, but it uses less than 3 flips.... Regenerating....", moduleID, tries + 1);
+                    tries++;
+                    return false;
+                }
+                SolveSequence.Reverse();
+                string solutionString = solutionPath.Pop();
+                while(solutionPath.Count != 0)
+                    solutionString += "|" + solutionPath.Pop();
+                StateExists.Clear();
+                if (Logging)
+					if (tries >= 400)
+						Debug.LogFormat("<Multicolored Switches {0}> A default valid path is {1}", moduleID, solutionString);
+					else
+						Debug.LogFormat("<Multicolored Switches {0}> A valid path is found in {1} tries, stop checking for a path. {2}", moduleID, tries + 1, solutionString);
+                return true;
+            }
+            for (int i = 0; i < 5; i++)
+            {
+                var newState = currentState.ToArray();
+                newState[i] = !newState[i];
+                if (AllStates.Where(state => !state.SequenceEqual(SubmissionState) && !state.SequenceEqual(RemovedState)).Any(state => state.SequenceEqual(newState)))
+                    continue;
+                if (!StateExists.Any(node => node.SwitchState.SequenceEqual(newState)))
+                {
+                    StateExists.Add(new SwitchGraphs(newState, currentState, i + 1));
+                    switchQueue.Enqueue(newState);
+                }
+            }
+            if (!runOnce && StateExists.Count < 2 && !autosolving)
+            {
+                switchQueue.Clear();
+                StateExists.Clear();
+                if (Logging)
+                    Debug.LogFormat("<MultiColored Switches {0}> Try {1} has less than 2 paths from the starting state.... Regenerating....", moduleID, tries + 1);
+                tries++;
+                return false;
+            }
+            runOnce = true;
+        }
+        if (Logging)
+            Debug.LogFormat("<MultiColored Switches {0}> Try {1} failed.... Regenerating....", moduleID, tries + 1);
+        tries++;
+        if (tries >= 400)
+        {
+			Debug.LogFormat("<MultiColored Switches {0}> Too many attempts in generating a valid path, using the default case.", moduleID);
+            Generate(true);
+			CheckPath();
+			return true;
+        }
+        return false;
+    }
+    bool CheckIfStateInArray(bool[] check)
+    {
+        for(int j = 0; j < 12; j++)
+        {
+            if (CheckIfArraysSame(check, AllStates[j])) return true;
+        }
+        return false;
+    }
+    void SetStatesEqual(bool[] current,bool[] equal)
+    {
+        for (int i = 0; i < 5; i++) current[i] = equal[i];
     }
     StringBuilder SwitchColorsLog()
     {
@@ -224,8 +414,8 @@ public class MultiColoredSwitches : MonoBehaviour
         }
         else
         {
-            solutionindex = IndexMin(SocketNumbers);
-            removedindex = IndexMax(SocketNumbers);
+            solutionindex = group * 3 + IndexMin(SocketNumbers);
+            removedindex = group * 3 + IndexMax(SocketNumbers);
         }
         SolutionIndex = solutionindex;
         RemovedIndex = removedindex;
@@ -333,7 +523,7 @@ public class MultiColoredSwitches : MonoBehaviour
         else if (SwitchesSameAsAllStates(ExpectedSwitchesStates)&&!Solved)
         {
             module.HandleStrike();
-          Debug.LogFormat("[Multicolored Switches #{3}] Strike! You flipped switch {0} when the state was {1}, which will make the switches states {2}", selectedswitch,TurnBitsToString(SwitchesStates),TurnBitsToString(ExpectedSwitchesStates),moduleID);
+          Debug.LogFormat("[Multicolored Switches #{3}] Strike! You flipped switch {0} when the state was {1}, which will make the switches states {2}", selectedswitch+1,TurnBitsToString(SwitchesStates),TurnBitsToString(ExpectedSwitchesStates),moduleID);
           Debug.LogFormat("[Multicolored Switches #{0}] Which is one of the forbidden states.", moduleID);
         }
         else
@@ -344,19 +534,9 @@ public class MultiColoredSwitches : MonoBehaviour
             StartCoroutine(FlipSwitch(selectedswitch));
         }
     }
-    string LEDLetters(LED[] array,int cycle)
-    {
-        string led = "";
-        if (cycle == 1)
-        {
-            for (int i = 0; i < 5; i++)
-            {
-            }
-        }
-        return led;
-    }
     IEnumerator FlipSwitch(int selected)
     {
+        Animation = true;
         const float duration = .3f;
         var startTime = Time.fixedTime;
         if (Switches[selected].State)
@@ -379,6 +559,7 @@ public class MultiColoredSwitches : MonoBehaviour
             while (Time.fixedTime < startTime + duration);
             Switches[selected].SwitchModel.transform.localEulerAngles = new Vector3(-55f, 0, 0);
         }
+        Animation = false;
     }
     bool SwitchesSameAsAllStates(bool[] switchstate)
     {
@@ -493,7 +674,7 @@ public class MultiColoredSwitches : MonoBehaviour
         }
     }
         
-    void NewLEDS()
+    void NewLEDS(bool fallBackToDefault = false, int[][][] defaultLEDColors = null)
     {
         for (int i = 0; i < 5; i++)
         {
@@ -501,8 +682,11 @@ public class MultiColoredSwitches : MonoBehaviour
             _led.LEDModel = LEDModelsUP[i];
             for (int j = 0; j < 2; j++)
             {
-                
-                int randomcolorled = Random.Range(0, 8);
+                int randomcolorled;
+                if (fallBackToDefault)
+                    randomcolorled = defaultLEDColors[0][j][i];
+                else
+                    randomcolorled = Random.Range(0, 8);
                 if (j == 0)
                 {
                     switch (randomcolorled)
@@ -638,7 +822,11 @@ public class MultiColoredSwitches : MonoBehaviour
             led.LEDModel = LEDModelsDOWN[i];
             for (int j = 0; j < 2; j++)
             {
-                int randomcolorled = Random.Range(0, 8);
+                int randomcolorled;
+                if (fallBackToDefault)
+                    randomcolorled = defaultLEDColors[1][j][i];
+                else
+                    randomcolorled = Random.Range(0, 8);
                 if (j == 0)
                 {
                     switch (randomcolorled)
@@ -794,7 +982,7 @@ public class MultiColoredSwitches : MonoBehaviour
         AllStates[startIndex + 4] = selectedG2;
         AllStates[startIndex + 5] = selectedB2;
     }
-    void PickColorSwitchesAndSockets()
+    void PickColorSwitchesAndSockets(bool fallBackToDefault = false, int[] defaultSwitchesColors = null, int[] defaultSwitchesStates = null, int[] defaultSocketsColors = null)
     {
         for (int i = 0; i < 5; i++)
         {
@@ -802,9 +990,16 @@ public class MultiColoredSwitches : MonoBehaviour
             Switches[i] = _switch;
             _switch.SwitchModel = SwitchModels[i];
             _switch.Socket = SocketModels[i];
-            _switch.RandomState();
+            if (fallBackToDefault)
+                _switch.RandomState(fallBackToDefault, defaultSwitchesStates[i]);
+            else
+                _switch.RandomState();
             SwitchesStates[i] = _switch.State;
-            int randomcolorswitch = Random.Range(0, 8);
+            int randomcolorswitch;
+            if (fallBackToDefault)
+                randomcolorswitch = defaultSwitchesColors[i];
+            else
+                randomcolorswitch = Random.Range(0, 8);
             switch (randomcolorswitch)
             {
                 case 0:
@@ -852,7 +1047,11 @@ public class MultiColoredSwitches : MonoBehaviour
                     _switch.SwitchModel.GetComponent<MeshRenderer>().material = SwitchesAndSocketsColors[7];
                     break;
             }
-            int randomcolorsocket = Random.Range(0, 8);
+            int randomcolorsocket;
+            if (fallBackToDefault)
+                randomcolorsocket = defaultSocketsColors[i];
+            else
+                randomcolorsocket = Random.Range(0, 8);
             switch (randomcolorsocket)
             {
                 case 0:
@@ -904,10 +1103,73 @@ public class MultiColoredSwitches : MonoBehaviour
         }
     }
 
-    // Update is called once per frame
-    void Update()
+    //twitch plays
+    #pragma warning disable 414
+    private readonly string TwitchHelpMessage = @"!{0} 1 2 3 4 5 [Toggles the specified switches where 1 is leftmost and 5 is rightmost]";
+    #pragma warning restore 414
+    IEnumerator ProcessTwitchCommand(string command)
     {
-
-
+        string[] parameters = command.Split(new [] { ' ' }, System.StringSplitOptions.RemoveEmptyEntries);
+        bool extraitem = false;
+        if (Regex.IsMatch(parameters[0], @"^\s*press\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant) || Regex.IsMatch(parameters[0], @"^\s*toggle\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant) || Regex.IsMatch(parameters[0], @"^\s*switch\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant) || Regex.IsMatch(parameters[0], @"^\s*flip\s*$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))
+        {
+            extraitem = true;
+            if (parameters.Length == 1)
+            {
+                yield return "sendtochaterror Please specify the switches that need to be flipped!";
+                yield break;
+            }
+        }
+        string[] valids = { "1", "2", "3", "4", "5" };
+        if (extraitem)
+        {
+            for(int i = 1; i < parameters.Length; i++)
+            {
+                if (!valids.Contains(parameters[i]))
+                {
+                    yield return "sendtochaterror The specified switch '"+parameters[i]+"' is invalid!";
+                    yield break;
+                }
+            }
+            yield return null;
+            for (int i = 1; i < parameters.Length; i++)
+            {
+                int temp = 0;
+                int.TryParse(parameters[i], out temp);
+                temp -= 1;
+                Switches[temp].SwitchModel.GetComponent<KMSelectable>().OnInteract();
+                yield return new WaitForSeconds(0.2f);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                if (!valids.Contains(parameters[i]))
+                {
+                    yield return "sendtochaterror The specified switch '" + parameters[i] + "' is invalid!";
+                    yield break;
+                }
+            }
+            yield return null;
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                int temp = 0;
+                int.TryParse(parameters[i], out temp);
+                temp -= 1;
+                Switches[temp].SwitchModel.GetComponent<KMSelectable>().OnInteract();
+                yield return new WaitForSeconds(0.2f);
+            }
+        }
+    }
+    IEnumerator TwitchHandleForcedSolve()
+    {
+        CheckPath(false, true);
+        for (int index = 0; index < SolveSequence.Count; index++)
+        {
+            while (Animation)
+                yield return true;
+            Switches[SolveSequence[index] - 1].SwitchModel.GetComponent<KMSelectable>().OnInteract();
+        }
     }
 }
